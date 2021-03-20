@@ -169,6 +169,12 @@ class OneCycleScheduler(Callback):
         plt.plot(self.mom)
 
 
+def get_lr_metric(optimizer):
+    def lr(y_true, y_pred):
+        return optimizer._decayed_lr(tf.float32) # I use ._decayed_lr method instead of .lr
+    return lr
+
+
 # Custom loss function
 def macro_double_soft_f1(y, y_hat):
     """Compute the macro soft F1-score as a cost (average 1 - soft-F1 across all labels).
@@ -400,8 +406,11 @@ def Build_InceptionTime(input_shape, num_classes, num_modules, learning_rate, wd
     elif opt == 'AdamWeightDecay':
         optimizer = transformers.AdamWeightDecay(learning_rate=learning_rate, weight_decay_rate=wd )#, beta_2=0.99, epsilon=1e-5)
     
+    # Metrics
     lr_metric = get_lr_metric(optimizer)
-    # model.load_weights(checkpoint_path)
+    auroc = tf.keras.metrics.AUC()
+    F1 = tfa.metrics.F1Score(num_classes=num_classes, threshold=0.5, average='macro')
+    
     model.compile(loss=loss, 
                   optimizer=optimizer,
                   metrics=['accuracy', auroc, F1, lr_metric])
