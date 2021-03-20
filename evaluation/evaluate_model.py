@@ -20,7 +20,7 @@ import numpy as np, os, os.path, sys
 
 def evaluate_model(label_directory, output_directory):
     # Define the weights, the SNOMED CT code for the normal class, and equivalent SNOMED CT codes.
-    weights_file = 'weights.csv'
+    weights_file = os.path.join(sys.path[0], 'weights.csv')
     normal_class = '426783006'
     equivalent_classes = [['713427006', '59118001'], ['284470004', '63593006'], ['427172004', '17338001']]
 
