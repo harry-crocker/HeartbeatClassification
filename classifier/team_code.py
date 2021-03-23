@@ -5,13 +5,17 @@
 
 from helper_code import *
 import numpy as np, os, sys, joblib
+import tensorflow as tf
 from sklearn.impute import SimpleImputer
 from sklearn.ensemble import RandomForestClassifier
+from ..model_funcs import *
+from ..data_funcs import *
 
-twelve_lead_model_filename = '12_lead_model.sav'
-six_lead_model_filename = '6_lead_model.sav'
-three_lead_model_filename = '3_lead_model.sav'
-two_lead_model_filename = '2_lead_model.sav'
+# To change when found save model
+twelve_lead_model_filename = '12_lead_model'
+six_lead_model_filename = '6_lead_model'
+three_lead_model_filename = '3_lead_model'
+two_lead_model_filename = '2_lead_model'
 
 ################################################################################
 #
@@ -19,121 +23,106 @@ two_lead_model_filename = '2_lead_model.sav'
 #
 ################################################################################
 
+
 # Train your model. This function is *required*. Do *not* change the arguments of this function.
 def training_code(data_directory, model_directory):
-    # Find header and recording files.
-    print('Finding header and recording files...')
-
-    header_files, recording_files = find_challenge_files(data_directory)
-    num_recordings = len(recording_files)
-
-    if not num_recordings:
-        raise Exception('No data was provided.')
-
     # Create a folder for the model if it does not already exist.
     if not os.path.isdir(model_directory):
         os.mkdir(model_directory)
 
-    # Extract classes from dataset.
+    # Extract classes from dx_mapping_scored.csv file as want to have same classes for all models
     print('Extracting classes...')
-
-    classes = set()
-    for header_file in header_files:
-        header = load_header(header_file)
-        classes |= set(get_labels(header))
-    if all(is_integer(x) for x in classes):
-        classes = sorted(classes, key=lambda x: int(x)) # Sort classes numerically if numbers.
-    else:
-        classes = sorted(classes) # Sort classes alphanumerically otherwise.
+    classes, abb_classes = get_classes()
     num_classes = len(classes)
 
     # Extract features and labels from dataset.
     print('Extracting features and labels...')
+    X = []
+    y = []
 
-    data = np.zeros((num_recordings, 14), dtype=np.float32) # 14 features: one feature for each lead, one feature for age, and one feature for sex
-    labels = np.zeros((num_recordings, num_classes), dtype=np.bool) # One-hot encoding of classes
+    # In the real submission all training files are in a single folder
+    header_files, recording_files = find_challenge_files(data_directory)
+    # Drop files in train/test split
+    # header_files, recording_files = recordings_to_keep(header_files, recording_files, data_directory, training)
+    num_recordings = len(recording_files)
+    print(num_recordings, 'Files found')
+    if not num_recordings:
+        raise Exception('No data within:', data_directory.split('/')[-1])
 
-    for i in range(num_recordings):
-        print('    {}/{}...'.format(i+1, num_recordings))
 
-        # Load header and recording.
-        header = load_header(header_files[i])
-        recording = load_recording(recording_files[i])
 
-        # Get age, sex and root mean square of the leads.
-        age, sex, rms = get_features(header, recording, twelve_leads)
-        data[i, 0:12] = rms
-        data[i, 12] = age
-        data[i, 13] = sex
+    # Load model configuration file
 
-        current_labels = get_labels(header)
-        for label in current_labels:
-            if label in classes:
-                j = classes.index(label)
-                labels[i, j] = 1
+    # run = wandb.init(project='HeartbeatClassification')
+    # config = wandb.config
+    class Config_file():
+        pass
 
-    # Train models.
+    config = Config_file()
 
-    # Define parameters for random forest classifier.
-    n_estimators = 3     # Number of trees in the forest.
-    max_leaf_nodes = 100 # Maximum number of leaf nodes in each tree.
-    random_state = 0     # Random state; set for reproducibility.
+    config.num_modules = 6 # 6
+    config.epochs = 2 # PTB-XL = 50
+    config.lr = 3e-3  # 1e-2
+    config.batch_size = 32  # PTB-XL = 128
+    config.ctype = 'subdiagnostic'
+    config.optimizer='AdamWeightDecay'
+    config.wd = 1e-2 # Float
+    config.Window_length = 125 # 250
+    config.loss_func = 'BC'   # BC Or F1
+    config.SpE = 1 # 1
+    config.filters = 32
+    config.kernel_sizes = [9, 23, 49]
+    config.head_nodes = 2048
 
-    # Train 12-lead ECG model.
-    print('Training 12-lead ECG model...')
+    input_shape = [config.Window_length, 12]
+    lap = 0.5
 
-    leads = twelve_leads
+    cbs = []
+    # cbs.append(WandbCallback())
+    # LR Schedule callback 
+    steps = config.SpE * np.ceil(len(recording_files) / config.batch_size) * config.epochs
+    lr_schedule = OneCycleScheduler(config.lr, steps, wd=config.wd, mom_min=0.85, mom_max=0.95)
+    cbs.append(lr_schedule)
+        
+    # Build Model
+    model = Build_InceptionTime(input_shape, num_classes, config.num_modules, config.lr, config.wd, config.optimizer, config.loss_func, 
+                                config.Window_length, lap, config.filters, config.kernel_sizes, config.head_nodes)
+
+    # Train model
+    history = model.fit(train_generator(header_files, recording_files, config.Window_length, config.batch_size), 
+                    steps_per_epoch= steps // config.epochs,
+                    epochs=config.epochs, 
+                    batch_size=config.batch_size, 
+                    # validation_data=(X_val, y_val),
+                    callbacks=cbs)
+
+    # Save model
     filename = os.path.join(model_directory, twelve_lead_model_filename)
+    model.save(filename)
 
-    feature_indices = [twelve_leads.index(lead) for lead in leads] + [12, 13]
-    features = data[:, feature_indices]
+    # Train models
 
-    imputer = SimpleImputer().fit(features)
-    features = imputer.transform(features)
-    classifier = RandomForestClassifier(n_estimators=n_estimators, max_leaf_nodes=max_leaf_nodes, random_state=random_state).fit(features, labels)
-    save_model(filename, classes, leads, imputer, classifier)
 
-    # Train 6-lead ECG model.
-    print('Training 6-lead ECG model...')
+    ### Adapt this section to only train the number of leads we want rather than all 4 models every time
+    # Train 12-lead ECG model.
+    # print('Training 12-lead ECG model...')
 
-    leads = six_leads
-    filename = os.path.join(model_directory, six_lead_model_filename)
+    # leads = twelve_leads
+    # filename = os.path.join(model_directory, twelve_lead_model_filename)
 
-    feature_indices = [twelve_leads.index(lead) for lead in leads] + [12, 13]
-    features = data[:, feature_indices]
+    # # Chooses which values of data to use where [12, 13] are age and sex
+    # # Feed this into generator for extracting correct leads
+    # # Will also need to ensure that when loading recording that leads are in correct order
+    # feature_indices = [twelve_leads.index(lead) for lead in leads] + [12, 13]
+    # features = data[:, feature_indices]
 
-    imputer = SimpleImputer().fit(features)
-    features = imputer.transform(features)
-    classifier = RandomForestClassifier(n_estimators=n_estimators, max_leaf_nodes=max_leaf_nodes, random_state=random_state).fit(features, labels)
-    save_model(filename, classes, leads, imputer, classifier)
+    # imputer = SimpleImputer().fit(features)
+    # features = imputer.transform(features)
+    # classifier = RandomForestClassifier(n_estimators=n_estimators, max_leaf_nodes=max_leaf_nodes, random_state=random_state).fit(features, labels)
+    # #### Need to investigate this function
+    # save_model(filename, classes, leads, imputer, classifier)
 
-    # Train 3-lead ECG model.
-    print('Training 3-lead ECG model...')
 
-    leads = three_leads
-    filename = os.path.join(model_directory, three_lead_model_filename)
-
-    feature_indices = [twelve_leads.index(lead) for lead in leads] + [12, 13]
-    features = data[:, feature_indices]
-
-    imputer = SimpleImputer().fit(features)
-    features = imputer.transform(features)
-    classifier = RandomForestClassifier(n_estimators=n_estimators, max_leaf_nodes=max_leaf_nodes, random_state=random_state).fit(features, labels)
-    save_model(filename, classes, leads, imputer, classifier)
-
-    # Train 2-lead ECG model.
-    print('Training 2-lead ECG model...')
-
-    leads = two_leads
-    filename = os.path.join(model_directory, two_lead_model_filename)
-
-    feature_indices = [twelve_leads.index(lead) for lead in leads] + [12, 13]
-    features = data[:, feature_indices]
-
-    imputer = SimpleImputer().fit(features)
-    features = imputer.transform(features)
-    classifier = RandomForestClassifier(n_estimators=n_estimators, max_leaf_nodes=max_leaf_nodes, random_state=random_state).fit(features, labels)
-    save_model(filename, classes, leads, imputer, classifier)
 
 ################################################################################
 #
@@ -142,6 +131,7 @@ def training_code(data_directory, model_directory):
 ################################################################################
 
 # Save your trained models.
+## Dont use this
 def save_model(filename, classes, leads, imputer, classifier):
     # Construct a data structure for the model and save it.
     d = {'classes': classes, 'leads': leads, 'imputer': imputer, 'classifier': classifier}
@@ -169,7 +159,7 @@ def load_two_lead_model(model_directory):
 
 # Generic function for loading a model.
 def load_model(filename):
-    return joblib.load(filename)
+    return tf.keras.models.load_model(filename)
 
 ################################################################################
 #
@@ -194,30 +184,29 @@ def run_two_lead_model(model, header, recording):
     return run_model(model, header, recording)
 
 # Generic function for running a trained model.
+## Change this to accept a single recording 
+## Classes should use my function get_classes()
 def run_model(model, header, recording):
-    classes = model['classes']
-    leads = model['leads']
-    imputer = model['imputer']
-    classifier = model['classifier']
+    # Preprocess recording
+    recording = np.swapaxes(recording, 0, 1)    # Needs to be of form (num_samples, num_channels)
+    # Get sampling data from header
+    frequency = get_frequency(header)
+    num_samples = get_num_samples(header)
+    # Downsample the recording
+    recording = downsample_recording(recording, frequency, num_samples)
+    recording = np.expand_dims(recording, 0)    # Needs to be of form (num_recordings, num_samples, num_channels)
 
-    # Load features.
-    num_leads = len(leads)
-    data = np.zeros(num_leads+2, dtype=np.float32)
-    age, sex, rms = get_features(header, recording, leads)
-    data[0:num_leads] = rms
-    data[num_leads] = age
-    data[num_leads+1] = sex
+    classes, _ = get_classes()
 
-    # Impute missing data.
-    features = data.reshape(1, -1)
-    features = imputer.transform(features)
+    # Predict
+    outputs = model.compute_predictions(recording)
 
     # Predict labels and probabilities.
-    labels = classifier.predict(features)
-    labels = np.asarray(labels, dtype=np.int)[0]
+    thresh = 0.4        # Could find better thresholds and load them above from the model directory by appending 'benchmarks' to the end of filename
+    labels = np.where(outputs > thresh, 1, 0)
+    labels = list(labels[0])
 
-    probabilities = classifier.predict_proba(features)
-    probabilities = np.asarray(probabilities, dtype=np.float32)[:, 0, 1]
+    probabilities = list(outputs[0])
 
     return classes, labels, probabilities
 
@@ -228,7 +217,8 @@ def run_model(model, header, recording):
 ################################################################################
 
 # Extract features from the header and recording.
-def get_features(header, recording, leads):
+### Can use age and sex extraction from this but dont want the final rms part
+def get_features(header, recording, leads, preprocessing=False):
     # Extract age.
     age = get_age(header)
     if age is None:
@@ -252,16 +242,11 @@ def get_features(header, recording, leads):
     recording = recording[indices, :]
 
     # Pre-process recordings.
-    adc_gains = get_adcgains(header, leads)
-    baselines = get_baselines(header, leads)
-    num_leads = len(leads)
-    for i in range(num_leads):
-        recording[i, :] = (recording[i, :] - baselines[i]) / adc_gains[i]
+    if preprocessing:
+        adc_gains = get_adcgains(header, leads)
+        baselines = get_baselines(header, leads)
+        num_leads = len(leads)
+        for i in range(num_leads):
+            recording[i, :] = (recording[i, :] - baselines[i]) / adc_gains[i]
 
-    # Compute the root mean square of each ECG lead signal.
-    rms = np.zeros(num_leads, dtype=np.float32)
-    for i in range(num_leads):
-        x = recording[i, :]
-        rms[i] = np.sqrt(np.sum(x**2) / np.size(x))
-
-    return age, sex, rms
+    return age, sex, recording

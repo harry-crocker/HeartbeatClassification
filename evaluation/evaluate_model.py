@@ -30,6 +30,8 @@ def evaluate_model(label_directory, output_directory):
 
     # Load the label and output files.
     print('Loading label and output files...')
+    # The evaluation data
+    # label_files is the correct labels, output_files is the predicted labels
     label_files, output_files = find_challenge_files(label_directory, output_directory)
     labels = load_labels(label_files, classes, equivalent_classes)
     binary_outputs, scalar_outputs = load_outputs(output_files, classes, equivalent_classes)

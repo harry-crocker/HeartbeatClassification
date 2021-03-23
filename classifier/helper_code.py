@@ -23,6 +23,9 @@ def is_integer(x):
         return False
 
 # Find header and recording files.
+### Can use this, can run multiple times for mutiple data directories and join lists
+### Could also run a check to see if data already exists as a numpy file first to save time reading files
+### Need to check if loading from a single numpy file is faster
 def find_challenge_files(data_directory):
     header_files = list()
     recording_files = list()

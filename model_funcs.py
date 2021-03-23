@@ -8,65 +8,68 @@ from tensorflow.keras import layers
 import tensorflow_addons as tfa
 import transformers
 
-# Generator functions for producing segments of ECG
-def train_generator(X, y, wind, bs, prob_type):
-    if prob_type=='uniform':
-        # Calculate probabilities of each ECG being selected based on count of conditions
-        # Only needs to happen once
-        probs = []
-        cond_counts = np.count_nonzero(y, axis=0) # 1D array with the total number of each condition in y
-        ecg_counts = cond_counts * y  # 2D array, the above for each row/ecg where condition exists
-        for i in range(ecg_counts.shape[0]):
-            row = list(ecg_counts[i, :])
-            while 0 in row:  
-                row.remove(0)
-            value = np.mean(row)   # Can change this to see effect of min, mean, max etc
-            value = 1/value
-            probs.append(value)
+from classifier.helper_code import *
+from data_funcs import *
 
-        probs = probs/sum(probs)
-        
-    elif prob_type=='same':
-        probs  = None
-    else:
-        print('ERROR: prob_type value invalid')
-    
-    dist_tracker = [0]*y.shape[1]
-    
+######
+# TO DO LIST
+# - Modify generator to drop some leads where needed
+# - Use better thresholds in run_model()
+
+######
+# Generator functions for producing segments of ECG
+def train_generator(header_files, recording_files, wind, bs):
+    num_recordings = len(recording_files)
+    classes = get_classes() # List of possible classes 
+
+    # Need to reset these every batch
     inputs = []
     targets = []
-    bc = 0  # Batch count
-    max_start_idx = X.shape[1] - wind
-
-    t_idxs = np.random.randint(0, max_start_idx, size=bs)
-    # Select ecgs based on probabilities to ensure uniform share of conditions
-    ecg_idxs = np.random.choice(range(X.shape[0]), size=bs, p=probs)
+    bc = 0  # Batch count increments after every recording
+    # Select ecgs indexes for this batch
+    file_idxs = np.random.randint(0, num_recordings, size=bs)
     
     while True:
-        # Get the current indexes
-        t_idx = t_idxs[bc]
-        ecg_idx = ecg_idxs[bc]
-        # Get the segment and label
-        segment = X[ecg_idx, t_idx:t_idx+wind, :]
-        label = y[ecg_idx, :]
-        
-        # Append to list
+        # Get the current ecg index
+        file_idx = file_idxs[bc]
+
+        # Load the full recording and header 
+        header = load_header(header_files[i])
+        recording = load_recording(recording_files[i])
+        recording = np.swapaxes(recording, 0, 1)    # Needs to be of form (num_samples, num_channels)
+
+        # Get class labels from header
+        labels = one_hot_encode_labels(header, classes)
+        targets.append(labels)
+
+        # Get sampling data from header
+        frequency = get_frequency(header)
+        num_samples = get_num_samples(header)
+
+        # Downsample the recording
+        recording = downsample_recording(recording, frequency, num_samples)
+
+        # Get segement start time
+        print(recording.shape)
+        max_start_idx = recording.shape[0] - wind
+        t_idxs = np.random.randint(0, max_start_idx)
+
+        # Get the segment and append to list
+        segment = recording[t_idx:t_idx+wind]  
         inputs.append(segment)
-        targets.append(label)
         
         bc += 1
         if bc >= bs:
             # End of batch, output and reset
-            retX = np.array(inputs, dtype='float32')
-            rety = np.array(targets, dtype='float32')
+            retX = np.array(inputs)
+            rety = np.array(targets)
             yield (retX, rety)
             # Generator will resume here after yield
             inputs = []
             targets = []
-            bc = 0  # Batch count
-            max_start_idx = X.shape[1] - wind
-            t_idxs = np.random.randint(0, max_start_idx, size=bs)
-            ecg_idxs = np.random.randint(0, X.shape[0], size=bs)
+            bc = 0  # Batch count increments after every recording
+            # Select ecgs indexes for this batch
+            file_idxs = np.random.randint(0, num_recordings, size=bs)
 
 
 # Callback functions
@@ -215,7 +218,7 @@ class CustomModel(keras.Model):
         # Unpack the data
         x, y = data
         # Compute predictions
-        y_pred = self.compute_predictions(x, self.wind, self.lap)
+        y_pred = self.compute_predictions(x)
         # Updates the metrics tracking the loss
         self.compiled_loss(y, y_pred, regularization_losses=self.losses)
         # Update the metrics.
@@ -224,7 +227,9 @@ class CustomModel(keras.Model):
         # Note that it will include the loss (tracked in self.metrics).
         return {m.name: m.result() for m in self.metrics}
     
-    def compute_predictions(self, X, wind, lap):
+    def compute_predictions(self, X):
+        wind = self.wind
+        lap = self.lap
         sample_length = X.shape[1]
         max_start_idx = sample_length - wind # Exclusive
         y_pred = []
